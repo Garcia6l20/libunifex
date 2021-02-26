@@ -20,7 +20,7 @@ mark_as_advanced(LIBURING_INCLUDE_DIR)
 
 include(FindPackageHandleStandardArgs)
 FIND_PACKAGE_HANDLE_STANDARD_ARGS(
-        LIBURING
+        LibUring
         REQUIRED_VARS LIBURING_INCLUDE_DIR)
 
 if(LIBURING_FOUND)

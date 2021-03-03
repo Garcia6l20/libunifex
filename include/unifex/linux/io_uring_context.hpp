@@ -55,8 +55,10 @@ class io_uring_context {
   class schedule_at_sender;
   template <typename Duration>
   class schedule_after_sender;
-  class read_sender;
-  class write_sender;
+  template <uint8_t, typename>
+  class iovec_sender;
+  using read_sender = io_uring_context::iovec_sender<IORING_OP_READV, std::byte>;
+  using write_sender = io_uring_context::iovec_sender<IORING_OP_WRITEV, std::byte const>;
   class async_read_only_file;
   class async_read_write_file;
   class async_write_only_file;
@@ -71,7 +73,7 @@ class io_uring_context {
 
   scheduler get_scheduler() noexcept;
 
- private:
+ protected:
   struct operation_base {
     operation_base() noexcept {}
     operation_base* next_;
@@ -92,6 +94,7 @@ class io_uring_context {
   };
 
   using time_point = linuxos::monotonic_clock::time_point;
+  using duration = linuxos::monotonic_clock::duration;
 
   struct schedule_at_operation : operation_base {
     explicit schedule_at_operation(
@@ -393,7 +396,8 @@ class io_uring_context::schedule_sender {
   io_uring_context& context_;
 };
 
-class io_uring_context::read_sender {
+template <uint8_t op_code, typename DataT>
+class io_uring_context::iovec_sender {
   using offset_t = std::int64_t;
 
   template <typename Receiver>
@@ -402,12 +406,13 @@ class io_uring_context::read_sender {
 
    public:
     template <typename Receiver2>
-    explicit operation(const read_sender& sender, Receiver2&& r)
+    explicit operation(const iovec_sender& sender, Receiver2&& r)
         : context_(sender.context_),
           fd_(sender.fd_),
           offset_(sender.offset_),
           receiver_((Receiver2 &&) r) {
-      buffer_[0].iov_base = sender.buffer_.data();
+      buffer_[0].iov_base =
+          const_cast<void*>(reinterpret_cast<const void*>(sender.buffer_.data()));
       buffer_[0].iov_len = sender.buffer_.size();
     }
 
@@ -429,7 +434,7 @@ class io_uring_context::read_sender {
       assert(context_.is_running_on_io_thread());
 
       auto populateSqe = [this](io_uring_sqe & sqe) noexcept {
-        sqe.opcode = IORING_OP_READV;
+        sqe.opcode = op_code;
         sqe.flags = 0;
         sqe.ioprio = 0;
         sqe.fd = fd_;
@@ -441,7 +446,7 @@ class io_uring_context::read_sender {
             static_cast<completion_base*>(this));
         sqe.__pad2[0] = sqe.__pad2[1] = sqe.__pad2[2] = 0;
 
-        this->execute_ = &operation::on_read_complete;
+        this->execute_ = &operation::on_operation_complete;
       };
 
       if (!context_.try_submit_io(populateSqe)) {
@@ -450,7 +455,7 @@ class io_uring_context::read_sender {
       }
     }
 
-    static void on_read_complete(operation_base* op) noexcept {
+    static void on_operation_complete(operation_base* op) noexcept {
       auto& self = *static_cast<operation*>(op);
       if (self.result_ >= 0) {
         if constexpr (noexcept(unifex::set_value(std::move(self.receiver_), ssize_t(self.result_)))) {
@@ -492,11 +497,11 @@ class io_uring_context::read_sender {
 
   static constexpr bool sends_done = true;
 
-  explicit read_sender(
+  explicit iovec_sender(
       io_uring_context& context,
       int fd,
       offset_t offset,
-      span<std::byte> buffer) noexcept
+      span<DataT> buffer) noexcept
       : context_(context), fd_(fd), offset_(offset), buffer_(buffer) {}
 
   template <typename Receiver>
@@ -508,125 +513,7 @@ class io_uring_context::read_sender {
   io_uring_context& context_;
   int fd_;
   offset_t offset_;
-  span<std::byte> buffer_;
-};
-
-class io_uring_context::write_sender {
-  using offset_t = std::int64_t;
-
-  template <typename Receiver>
-  class operation : private completion_base {
-    friend io_uring_context;
-
-   public:
-    template <typename Receiver2>
-    explicit operation(const write_sender& sender, Receiver2&& r)
-        : context_(sender.context_),
-          fd_(sender.fd_),
-          offset_(sender.offset_),
-          receiver_((Receiver2 &&) r) {
-      buffer_[0].iov_base = (void*)sender.buffer_.data();
-      buffer_[0].iov_len = sender.buffer_.size();
-    }
-
-    void start() noexcept {
-      if (!context_.is_running_on_io_thread()) {
-        this->execute_ = &operation::on_schedule_complete;
-        context_.schedule_remote(this);
-      } else {
-        start_io();
-      }
-    }
-
-   private:
-    static void on_schedule_complete(operation_base* op) noexcept {
-      static_cast<operation*>(op)->start_io();
-    }
-
-    void start_io() noexcept {
-      assert(context_.is_running_on_io_thread());
-
-      auto populateSqe = [this](io_uring_sqe & sqe) noexcept {
-        sqe.opcode = IORING_OP_WRITEV;
-        sqe.flags = 0;
-        sqe.ioprio = 0;
-        sqe.fd = fd_;
-        sqe.off = offset_;
-        sqe.addr = reinterpret_cast<std::uintptr_t>(&buffer_[0]);
-        sqe.len = 1;
-        sqe.rw_flags = 0;
-        sqe.user_data = reinterpret_cast<std::uintptr_t>(
-            static_cast<completion_base*>(this));
-        sqe.__pad2[0] = sqe.__pad2[1] = sqe.__pad2[2] = 0;
-
-        this->execute_ = &operation::on_write_complete;
-      };
-
-      if (!context_.try_submit_io(populateSqe)) {
-        this->execute_ = &operation::on_schedule_complete;
-        context_.schedule_pending_io(this);
-      }
-    }
-
-    static void on_write_complete(operation_base* op) noexcept {
-      auto& self = *static_cast<operation*>(op);
-      if (self.result_ >= 0) {
-        if constexpr (noexcept(unifex::set_value(std::move(self.receiver_), ssize_t(self.result_)))) {
-          unifex::set_value(std::move(self.receiver_), ssize_t(self.result_));
-        } else {
-          UNIFEX_TRY {
-            unifex::set_value(std::move(self.receiver_), ssize_t(self.result_));
-          } UNIFEX_CATCH (...) {
-            unifex::set_error(std::move(self.receiver_), std::current_exception());
-          }
-        }
-      } else if (self.result_ == -ECANCELED) {
-        unifex::set_done(std::move(self.receiver_));
-      } else {
-        unifex::set_error(
-            std::move(self.receiver_),
-            std::error_code{-self.result_, std::system_category()});
-      }
-    }
-
-    io_uring_context& context_;
-    int fd_;
-    offset_t offset_;
-    iovec buffer_[1];
-    Receiver receiver_;
-  };
-
- public:
-  // Produces number of bytes read.
-  template <
-      template <typename...> class Variant,
-      template <typename...> class Tuple>
-  using value_types = Variant<Tuple<ssize_t>>;
-
-  // Note: Only case it might complete with exception_ptr is if the
-  // receiver's set_value() exits with an exception.
-  template <template <typename...> class Variant>
-  using error_types = Variant<std::error_code, std::exception_ptr>;
-
-  static constexpr bool sends_done = true;
-
-  explicit write_sender(
-      io_uring_context& context,
-      int fd,
-      offset_t offset,
-      span<const std::byte> buffer) noexcept
-      : context_(context), fd_(fd), offset_(offset), buffer_(buffer) {}
-
-  template <typename Receiver>
-  operation<remove_cvref_t<Receiver>> connect(Receiver&& r) {
-    return operation<remove_cvref_t<Receiver>>{*this, (Receiver &&) r};
-  }
-
- private:
-  io_uring_context& context_;
-  int fd_;
-  offset_t offset_;
-  span<const std::byte> buffer_;
+  span<DataT> buffer_;
 };
 
 class io_uring_context::async_read_only_file {
@@ -912,6 +799,10 @@ class io_uring_context::scheduler {
 
   schedule_at_sender schedule_at(const time_point& dueTime) const noexcept {
     return schedule_at_sender{*context_, dueTime};
+  }
+
+  schedule_at_sender schedule_after(const duration& duration) const noexcept {
+    return schedule_at_sender{*context_, now() + duration};
   }
 
  private:

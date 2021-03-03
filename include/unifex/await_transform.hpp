@@ -37,7 +37,7 @@
 
 namespace unifex {
 namespace _util {
-enum class _state { empty, value, exception, done };
+enum class _state { empty, value, exception, error_code, done };
 
 template <typename Value>
 struct _expected {
@@ -52,6 +52,7 @@ struct _expected {
   union {
     manual_lifetime<Value> value_;
     manual_lifetime<std::exception_ptr> exception_;
+    manual_lifetime<std::error_code> error_code_;
   };
 private:
   void _reset_value(_state s) noexcept {
@@ -61,6 +62,9 @@ private:
       break;
     case _state::exception:
       unifex::deactivate_union_member(exception_);
+      break;
+    case _state::error_code:
+      unifex::deactivate_union_member(error_code_);
       break;
     default:;
     }
@@ -112,6 +116,12 @@ protected:
       result_->state_ = _state::exception;
       continuation_.resume();
     }
+
+    void set_error(std::error_code &&ec) && noexcept {
+      unifex::activate_union_member(result_->error_code_, std::forward<std::error_code>(ec));
+      result_->state_ = _state::error_code;
+      continuation_.resume();
+    }
     
     void set_done() && noexcept {
       result_->state_ = _state::done;
@@ -149,6 +159,10 @@ public:
     switch (result_.state_) {
     case _state::value:
       return std::move(result_.value_).get();
+    case _state::error_code: {
+      auto ec = std::move(result_.error_code_).get();
+      throw std::system_error(ec.value(), ec.category(), ec.message());
+    }
     default:
       assert(result_.state_ == _state::exception);
       std::rethrow_exception(result_.exception_.get());

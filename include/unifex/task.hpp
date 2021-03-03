@@ -175,6 +175,8 @@ struct _promise {
     decltype(auto) result() {
       if (this->expected_.state_ == _state::exception) {
         std::rethrow_exception(std::move(this->expected_.exception_).get());
+      } else if (this->expected_.state_ == _state::error_code) {
+        throw std::move(this->expected_.error_code_).get();
       }
       return std::move(this->expected_.value_).get();
     }

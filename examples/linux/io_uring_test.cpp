@@ -18,6 +18,7 @@
 
 #if !UNIFEX_NO_LIBURING
 
+#include <unifex/any_sender_of.hpp>
 #include <unifex/inplace_stop_token.hpp>
 #include <unifex/just.hpp>
 #include <unifex/let.hpp>
@@ -150,6 +151,17 @@ int main() {
         when_all(
             read_file(scheduler, "test.txt"),
             read_file(scheduler, "test.txt"))));
+
+    auto read_or_write = [&](bool read = true) -> any_sender_of<> {
+      if (read) {
+        return read_file(scheduler, "test.txt");
+      } else {
+        return write_new_file(scheduler, "test.txt");
+      }
+    };
+
+    sync_wait(read_or_write());
+
   } catch (const std::exception& ex) {
     std::printf("error: %s\n", ex.what());
   }

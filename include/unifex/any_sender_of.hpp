@@ -44,6 +44,7 @@ struct _rec_ref_base<type_list<CPOs...>> {
       any_ref<
           tag_t<overload(set_value, sig<void(this_&&, Values...)>)>,
           tag_t<overload(set_error, sig<void(this_&&, std::exception_ptr) noexcept>)>,
+          tag_t<overload(set_error, sig<void(this_&&, std::error_code) noexcept>)>,
           tag_t<overload(set_done, sig<void(this_&&) noexcept>)>,
           CPOs...>;
 #else
@@ -52,6 +53,7 @@ struct _rec_ref_base<type_list<CPOs...>> {
       any_ref<
           tag_t<overload<void(this_&&, Values...)>(set_value)>,
           tag_t<overload<void(this_&&, std::exception_ptr) noexcept>(set_error)>,
+          tag_t<overload<void(this_&&, std::error_code) noexcept>(set_error)>,
           tag_t<overload<void(this_&&) noexcept>(set_done)>,
           CPOs...>;
 #endif
@@ -219,7 +221,7 @@ struct _with_receiver_queries<CPOs...>::_sender<Values...>::type
   using value_types = Variant<Tuple<Values...>>;
 
   template <template <class...> class Variant>
-  using error_types = Variant<std::exception_ptr>;
+  using error_types = Variant<std::exception_ptr, std::error_code>;
 
   static constexpr bool sends_done = true;
 

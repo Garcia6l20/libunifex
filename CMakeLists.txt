@@ -23,6 +23,9 @@ if(BUILD_TESTING OR UNIFEX_BUILD_EXAMPLES)
   include(CTest)
 
   target_compile_features(gtest PUBLIC cxx_std_17)
+  if("${CMAKE_CXX_COMPILER_ID}" STREQUAL GNU)
+    target_compile_options(gtest PRIVATE "-Wno-error=maybe-uninitialized")
+  endif()
   target_compile_features(gtest_main PUBLIC cxx_std_17)
 
   add_subdirectory(examples)

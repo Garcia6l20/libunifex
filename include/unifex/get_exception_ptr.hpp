@@ -20,6 +20,7 @@
 #include <unifex/type_traits.hpp>
 
 #include <memory>
+#include <system_error>
 
 #include <unifex/detail/prologue.hpp>
 

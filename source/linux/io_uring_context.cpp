@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <sys/socket.h>
 
 //#define LOGGING_ENABLED
 
@@ -801,6 +802,19 @@ io_uring_context::async_read_only_file tag_invoke(
   }
 
   return io_uring_context::async_read_only_file{*scheduler.context_, result};
+}
+
+io_uring_context::async_socket tag_invoke(
+    tag_t<net::open_socket>,
+    io_uring_context::scheduler s,
+    int domain, int type, int protocol)
+{
+  int result = socket(domain, type, protocol);
+  if (result < 0) {
+    int errorCode = errno;
+    throw_(std::system_error{errorCode, std::system_category()});
+  }
+  return io_uring_context::async_socket{*s.context_, result};
 }
 
 io_uring_context::async_write_only_file tag_invoke(

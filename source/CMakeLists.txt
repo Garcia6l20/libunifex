@@ -15,7 +15,15 @@ target_sources(unifex
     thread_unsafe_event_loop.cpp
     timed_single_thread_context.cpp
     trampoline_scheduler.cpp
-    async_manual_reset_event.cpp)
+    async_manual_reset_event.cpp
+
+    net/ip_address.cpp
+    net/ip_endpoint.cpp
+    net/ipv4_address.cpp
+    net/ipv4_endpoint.cpp
+    net/ipv6_address.cpp
+    net/ipv6_endpoint.cpp
+  )
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_sources(unifex

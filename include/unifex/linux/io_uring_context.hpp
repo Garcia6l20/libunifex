@@ -33,6 +33,9 @@
 #include <unifex/linux/monotonic_clock.hpp>
 #include <unifex/linux/safe_file_descriptor.hpp>
 
+#include <unifex/net/networking_concepts.hpp>
+#include <unifex/net/ip_endpoint.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -60,6 +63,9 @@ class io_uring_context {
   class async_read_only_file;
   class async_read_write_file;
   class async_write_only_file;
+  class async_socket;
+  class send_to_sender;
+  class receive_from_sender;
   class scheduler;
 
   io_uring_context();
@@ -81,6 +87,89 @@ class io_uring_context {
   struct completion_base : operation_base {
     int result_;
   };
+
+    template <typename Receiver, template <class> typename Operation>
+    struct io_operation_base : completion_base {
+      explicit io_operation_base(auto& sender, Receiver&& r) noexcept
+        : context_{sender.context_}
+        , fd_{sender.fd_}
+        , receiver_{(Receiver &&) r} {}
+
+      void start() noexcept {
+        if (!context_.is_running_on_io_thread()) {
+          this->execute_ = &on_schedule_complete;
+          context_.schedule_remote(this);
+        } else {
+          start_io();
+        }
+      }
+
+      static void on_schedule_complete(operation_base* op) noexcept {
+        static_cast<io_operation_base*>(op)->start_io();
+      }
+
+      static auto& get_impl(operation_base* op) noexcept {
+        return *static_cast<Operation<Receiver>*>(op);
+      }
+
+      auto& get_impl() noexcept { return get_impl(this); }
+
+      void start_io() noexcept {
+        assert(context_.is_running_on_io_thread());
+        auto populateSqe = [this](io_uring_sqe& sqe) noexcept {
+          const auto [data, len, off] = get_impl().get_io_data();
+
+          sqe.opcode = get_impl().op_code;
+          sqe.flags = 0;
+          sqe.ioprio = 0;
+          sqe.fd = fd_;
+          sqe.off = off;
+          sqe.addr = reinterpret_cast<std::uintptr_t>(data);
+          sqe.len = 1;
+          sqe.rw_flags = 0;
+
+          sqe.user_data = reinterpret_cast<std::uintptr_t>(
+              static_cast<io_operation_base*>(this));
+          this->execute_ = &io_operation_base::on_operation_complete;
+        };
+
+        if (!context_.try_submit_io(populateSqe)) {
+          this->execute_ = &io_operation_base::on_schedule_complete;
+          context_.schedule_pending_io(this);
+        }
+      }
+
+      static void on_operation_complete(operation_base* op) noexcept {
+        auto& self = get_impl(op);
+        if (self.result_ >= 0) {
+          if constexpr (noexcept(unifex::set_value(
+                            std::move(self.receiver_),
+                            self.get_result()))) {
+            unifex::set_value(
+                std::move(self.receiver_), self.get_result());
+          } else {
+            UNIFEX_TRY {
+              unifex::set_value(
+                  std::move(self.receiver_), self.get_result());
+            }
+            UNIFEX_CATCH(...) {
+              unifex::set_error(
+                  std::move(self.receiver_), std::current_exception());
+            }
+          }
+        } else if (self.result_ == -ECANCELED) {
+          unifex::set_done(std::move(self.receiver_));
+        } else {
+          unifex::set_error(
+              std::move(self.receiver_),
+              std::error_code{-self.result_, std::system_category()});
+        }
+      }
+
+      io_uring_context& context_;
+      int fd_;
+      Receiver receiver_;
+    };
 
   struct stop_operation : operation_base {
     stop_operation() noexcept {
@@ -397,86 +486,28 @@ class io_uring_context::read_sender {
   using offset_t = std::int64_t;
 
   template <typename Receiver>
-  class operation : private completion_base {
+  class operation : public io_operation_base<Receiver, operation> {
     friend io_uring_context;
+    static constexpr auto op_code = IORING_OP_READV;
 
-   public:
-    template <typename Receiver2>
-    explicit operation(const read_sender& sender, Receiver2&& r)
-        : context_(sender.context_),
-          fd_(sender.fd_),
-          offset_(sender.offset_),
-          receiver_((Receiver2 &&) r) {
-      buffer_[0].iov_base = sender.buffer_.data();
+  public:
+    explicit operation(const read_sender& sender, Receiver&& r)
+      : io_operation_base<Receiver, operation>{sender, (Receiver &&) r}
+      , offset_{sender.offset_} {
+      buffer_[0].iov_base = (void*)sender.buffer_.data();
       buffer_[0].iov_len = sender.buffer_.size();
     }
 
-    void start() noexcept {
-      if (!context_.is_running_on_io_thread()) {
-        this->execute_ = &operation::on_schedule_complete;
-        context_.schedule_remote(this);
-      } else {
-        start_io();
-      }
+    auto get_io_data() noexcept {
+      return std::tuple{&buffer_[0], 1, offset_};
     }
+    auto get_result() noexcept { return size_t(this->result_); }
 
-   private:
-    static void on_schedule_complete(operation_base* op) noexcept {
-      static_cast<operation*>(op)->start_io();
-    }
-
-    void start_io() noexcept {
-      assert(context_.is_running_on_io_thread());
-
-      auto populateSqe = [this](io_uring_sqe & sqe) noexcept {
-        sqe.opcode = IORING_OP_READV;
-        sqe.flags = 0;
-        sqe.ioprio = 0;
-        sqe.fd = fd_;
-        sqe.off = offset_;
-        sqe.addr = reinterpret_cast<std::uintptr_t>(&buffer_[0]);
-        sqe.len = 1;
-        sqe.rw_flags = 0;
-        sqe.user_data = reinterpret_cast<std::uintptr_t>(
-            static_cast<completion_base*>(this));
-        sqe.__pad2[0] = sqe.__pad2[1] = sqe.__pad2[2] = 0;
-
-        this->execute_ = &operation::on_read_complete;
-      };
-
-      if (!context_.try_submit_io(populateSqe)) {
-        this->execute_ = &operation::on_schedule_complete;
-        context_.schedule_pending_io(this);
-      }
-    }
-
-    static void on_read_complete(operation_base* op) noexcept {
-      auto& self = *static_cast<operation*>(op);
-      if (self.result_ >= 0) {
-        if constexpr (noexcept(unifex::set_value(std::move(self.receiver_), ssize_t(self.result_)))) {
-          unifex::set_value(std::move(self.receiver_), ssize_t(self.result_));
-        } else {
-          UNIFEX_TRY {
-            unifex::set_value(std::move(self.receiver_), ssize_t(self.result_));
-          } UNIFEX_CATCH (...) {
-            unifex::set_error(std::move(self.receiver_), std::current_exception());
-          }
-        }
-      } else if (self.result_ == -ECANCELED) {
-        unifex::set_done(std::move(self.receiver_));
-      } else {
-        unifex::set_error(
-            std::move(self.receiver_),
-            std::error_code{-self.result_, std::system_category()});
-      }
-    }
-
-    io_uring_context& context_;
-    int fd_;
     offset_t offset_;
     iovec buffer_[1];
-    Receiver receiver_;
   };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
 
  public:
   // Produces number of bytes read.
@@ -497,7 +528,10 @@ class io_uring_context::read_sender {
       int fd,
       offset_t offset,
       span<std::byte> buffer) noexcept
-      : context_(context), fd_(fd), offset_(offset), buffer_(buffer) {}
+    : context_(context)
+    , fd_(fd)
+    , offset_(offset)
+    , buffer_(buffer) {}
 
   template <typename Receiver>
   operation<remove_cvref_t<Receiver>> connect(Receiver&& r) && {
@@ -515,86 +549,28 @@ class io_uring_context::write_sender {
   using offset_t = std::int64_t;
 
   template <typename Receiver>
-  class operation : private completion_base {
+  class operation : public io_operation_base<Receiver, operation> {
     friend io_uring_context;
+    static constexpr auto op_code = IORING_OP_WRITEV;
 
-   public:
-    template <typename Receiver2>
-    explicit operation(const write_sender& sender, Receiver2&& r)
-        : context_(sender.context_),
-          fd_(sender.fd_),
-          offset_(sender.offset_),
-          receiver_((Receiver2 &&) r) {
+  public:
+    explicit operation(const write_sender& sender, Receiver&& r)
+      : io_operation_base<Receiver, operation>{sender, (Receiver &&) r}
+      , offset_{sender.offset_} {
       buffer_[0].iov_base = (void*)sender.buffer_.data();
       buffer_[0].iov_len = sender.buffer_.size();
     }
 
-    void start() noexcept {
-      if (!context_.is_running_on_io_thread()) {
-        this->execute_ = &operation::on_schedule_complete;
-        context_.schedule_remote(this);
-      } else {
-        start_io();
-      }
+    auto get_io_data() noexcept {
+      return std::tuple{&buffer_[0], 1, offset_};
     }
+    auto get_result() noexcept { return size_t(this->result_); }
 
-   private:
-    static void on_schedule_complete(operation_base* op) noexcept {
-      static_cast<operation*>(op)->start_io();
-    }
-
-    void start_io() noexcept {
-      assert(context_.is_running_on_io_thread());
-
-      auto populateSqe = [this](io_uring_sqe & sqe) noexcept {
-        sqe.opcode = IORING_OP_WRITEV;
-        sqe.flags = 0;
-        sqe.ioprio = 0;
-        sqe.fd = fd_;
-        sqe.off = offset_;
-        sqe.addr = reinterpret_cast<std::uintptr_t>(&buffer_[0]);
-        sqe.len = 1;
-        sqe.rw_flags = 0;
-        sqe.user_data = reinterpret_cast<std::uintptr_t>(
-            static_cast<completion_base*>(this));
-        sqe.__pad2[0] = sqe.__pad2[1] = sqe.__pad2[2] = 0;
-
-        this->execute_ = &operation::on_write_complete;
-      };
-
-      if (!context_.try_submit_io(populateSqe)) {
-        this->execute_ = &operation::on_schedule_complete;
-        context_.schedule_pending_io(this);
-      }
-    }
-
-    static void on_write_complete(operation_base* op) noexcept {
-      auto& self = *static_cast<operation*>(op);
-      if (self.result_ >= 0) {
-        if constexpr (noexcept(unifex::set_value(std::move(self.receiver_), ssize_t(self.result_)))) {
-          unifex::set_value(std::move(self.receiver_), ssize_t(self.result_));
-        } else {
-          UNIFEX_TRY {
-            unifex::set_value(std::move(self.receiver_), ssize_t(self.result_));
-          } UNIFEX_CATCH (...) {
-            unifex::set_error(std::move(self.receiver_), std::current_exception());
-          }
-        }
-      } else if (self.result_ == -ECANCELED) {
-        unifex::set_done(std::move(self.receiver_));
-      } else {
-        unifex::set_error(
-            std::move(self.receiver_),
-            std::error_code{-self.result_, std::system_category()});
-      }
-    }
-
-    io_uring_context& context_;
-    int fd_;
     offset_t offset_;
     iovec buffer_[1];
-    Receiver receiver_;
   };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
 
  public:
   // Produces number of bytes read.
@@ -615,7 +591,10 @@ class io_uring_context::write_sender {
       int fd,
       offset_t offset,
       span<const std::byte> buffer) noexcept
-      : context_(context), fd_(fd), offset_(offset), buffer_(buffer) {}
+    : context_(context)
+    , fd_(fd)
+    , offset_(offset)
+    , buffer_(buffer) {}
 
   template <typename Receiver>
   operation<remove_cvref_t<Receiver>> connect(Receiver&& r) {
@@ -626,6 +605,127 @@ class io_uring_context::write_sender {
   io_uring_context& context_;
   int fd_;
   offset_t offset_;
+  span<const std::byte> buffer_;
+};
+
+class io_uring_context::send_to_sender {
+  template <typename Receiver>
+  struct operation : io_operation_base<Receiver, operation> {
+    static constexpr auto op_code = IORING_OP_SENDMSG;
+
+    friend io_uring_context;
+
+    explicit operation(send_to_sender& sender, Receiver&& r)
+      : io_operation_base<Receiver, operation>{sender, (Receiver &&) r} {
+      iovec_.iov_base = const_cast<std::byte*>(sender.buffer_.data());
+      iovec_.iov_len = sender.buffer_.size();
+      msghdr_.msg_namelen = sender.to_.to_sockaddr(sockaddr_storage_);
+    }
+    auto get_io_data() noexcept { return std::tuple{&msghdr_, 1, 0}; }
+    auto get_result() noexcept { return size_t(this->result_); }
+    sockaddr_storage sockaddr_storage_;
+    iovec iovec_;
+    msghdr msghdr_{
+        &sockaddr_storage_, sizeof(sockaddr_storage_), &iovec_, 1};
+  };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
+
+public:
+  // Produces number of bytes read.
+  template <
+      template <typename...>
+      class Variant,
+      template <typename...>
+      class Tuple>
+  using value_types = Variant<Tuple<ssize_t>>;
+
+  // Note: Only case it might complete with exception_ptr is if the
+  // receiver's set_value() exits with an exception.
+  template <template <typename...> class Variant>
+  using error_types = Variant<std::error_code, std::exception_ptr>;
+
+  static constexpr bool sends_done = true;
+
+  explicit send_to_sender(
+      io_uring_context& context,
+      int fd,
+      const net::ip_endpoint& endpoint,
+      span<const std::byte> buffer) noexcept
+    : context_{context}
+    , fd_{fd}
+    , buffer_{buffer}
+    , to_{endpoint} {}
+
+  template <typename Receiver>
+  auto connect(Receiver&& r) && {
+    return operation<Receiver>{*this, (Receiver &&) r};
+  }
+
+private:
+  io_uring_context& context_;
+  int fd_;
+  span<const std::byte> buffer_;
+  net::ip_endpoint to_;
+};
+
+class io_uring_context::receive_from_sender {
+  template <typename Receiver>
+  struct operation : io_operation_base<Receiver, operation> {
+    static constexpr auto op_code = IORING_OP_RECVMSG;
+
+    friend io_uring_context;
+
+    explicit operation(receive_from_sender& sender, Receiver&& r)
+      : io_operation_base<Receiver, operation>{sender, (Receiver &&) r} {
+      iovec_.iov_base = const_cast<std::byte*>(sender.buffer_.data());
+      iovec_.iov_len = sender.buffer_.size();
+    }
+    auto get_io_data() noexcept { return std::tuple{&msghdr_, 1, 0}; }
+    auto get_result() noexcept {
+      return std::make_tuple(
+          net::ip_endpoint::from_sockaddr(
+              *reinterpret_cast<sockaddr*>(&sockaddr_storage_)),
+          size_t(this->result_));
+    }
+    sockaddr_storage sockaddr_storage_;
+    iovec iovec_;
+    msghdr msghdr_{
+        &sockaddr_storage_, sizeof(sockaddr_storage_), &iovec_, 1};
+  };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
+
+public:
+  // Produces number of bytes read.
+  template <
+      template <typename...>
+      class Variant,
+      template <typename...>
+      class Tuple>
+  using value_types = Variant<Tuple<net::ip_endpoint, ssize_t>>;
+
+  // Note: Only case it might complete with exception_ptr is if the
+  // receiver's set_value() exits with an exception.
+  template <template <typename...> class Variant>
+  using error_types = Variant<std::error_code, std::exception_ptr>;
+
+  static constexpr bool sends_done = true;
+
+  explicit receive_from_sender(
+      io_uring_context& context, int fd, span<std::byte> buffer) noexcept
+    : context_{context}
+    , fd_{fd}
+    , buffer_{buffer} {}
+
+  template <typename Receiver>
+  auto connect(Receiver&& r) && {
+    return operation<Receiver>{*this, (Receiver &&) r};
+  }
+
+private:
+  io_uring_context& context_;
+  int fd_;
   span<const std::byte> buffer_;
 };
 
@@ -702,6 +802,58 @@ class io_uring_context::async_read_write_file {
   io_uring_context& context_;
   safe_file_descriptor fd_;
 };
+
+    class io_uring_context::async_socket {
+    public:
+      explicit async_socket(io_uring_context& context, int fd) noexcept
+        : context_{context}
+        , fd_{fd} {}
+
+      void bind(net::ip_endpoint const& endpoint = {}) {
+        sockaddr_storage storage{};
+        auto size = endpoint.to_sockaddr(storage);
+        if (auto error = ::bind(
+                fd_.get(), reinterpret_cast<const sockaddr*>(&storage), size);
+            error < 0) {
+          throw std::system_error(-errno, std::system_category());
+        }
+      }
+
+      [[nodiscard]] std::optional<net::ip_endpoint> local_endpoint() const {
+        sockaddr sockaddr_in_{};
+        socklen_t sockaddr_in_len = sizeof(sockaddr_in_);
+        if (getsockname(fd_.get(), &sockaddr_in_, &sockaddr_in_len) < 0) {
+          return std::nullopt;
+        }
+        return net::ip_endpoint::from_sockaddr(sockaddr_in_);
+      }
+
+      void listen(size_t count = 100) {
+        if (::listen(fd_.get(), int(count)) < 0) {
+          throw std::system_error(-errno, std::system_category());
+        }
+      }
+
+      // Customization points
+      friend auto tag_invoke(
+          tag_t<net::async_send_to>,
+          async_socket& socket,
+          const net::ip_endpoint& endpoint,
+          span<const std::byte> buffer) noexcept {
+        return send_to_sender{
+            socket.context_, socket.fd_.get(), endpoint, buffer};
+      }
+      friend auto tag_invoke(
+          tag_t<net::async_receive_from>,
+          async_socket& socket,
+          span<std::byte> buffer) noexcept {
+        return receive_from_sender{socket.context_, socket.fd_.get(), buffer};
+      }
+
+    private:
+      io_uring_context& context_;
+      safe_file_descriptor fd_;
+    };
 
 class io_uring_context::schedule_at_sender {
   template <typename Receiver>
@@ -917,6 +1069,10 @@ class io_uring_context::scheduler {
  private:
   friend io_uring_context;
 
+  friend io_uring_context::async_socket tag_invoke(
+      tag_t<net::open_socket>,
+      io_uring_context::scheduler s,
+      int domain, int type, int protocol);
   friend async_read_only_file tag_invoke(
       tag_t<open_file_read_only>,
       scheduler s,

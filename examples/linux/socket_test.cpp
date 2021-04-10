@@ -40,7 +40,7 @@ task<void> hello_udp(auto sched) {
   co_await when_all(
       [&]() -> task<void> {
         co_await net::async_send_to(
-            client, server_endpoint, as_bytes(span{"Hello !!!", 9}));
+            client, server_endpoint, as_bytes(span{"Hello UDP !!!", 13}));
       }(),
       [&]() -> task<void> {
         std::array<char, 64> buffer{};
@@ -48,9 +48,30 @@ task<void> hello_udp(auto sched) {
             server, as_writable_bytes(span{buffer}));
         std::cout << "received " << std::to_string(bytes_received) << " bytes from '" << from.to_string() << "': "
                   << std::string_view{buffer.data(), bytes_received} << '\n';
-        co_return;
       }());
-  co_return;
+}
+
+task<void> hello_tcp(auto sched) {
+  auto server = net::open_socket(sched, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  server.bind(net::ipv4_endpoint{net::ipv4_address::loopback(), 0});
+  auto server_endpoint = *server.local_endpoint();
+  std::cout << "tcp server listening at: " << server_endpoint.to_string()
+            << '\n';
+  auto client = net::open_socket(sched, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  co_await when_all(
+      [&]() -> task<void> {
+        std::array<char, 64> buffer{};
+        server.listen();
+        auto [from, conn] = co_await net::async_accept(server);
+        auto bytes_received = co_await net::async_receive(conn, as_writable_bytes(span{buffer}));
+        std::cout << "received " << std::to_string(bytes_received) << " bytes from '" << from.to_string() << "': "
+                  << std::string_view{buffer.data(), bytes_received} << '\n';
+      }(),
+      [&]() -> task<void> {
+        co_await net::async_connect(client, std::move(server_endpoint));
+        co_await net::async_send(
+            client, as_bytes(span{"Hello TCP !!!", 13}));
+      }());
 }
 
 int main() {
@@ -64,7 +85,7 @@ int main() {
     stopSource.request_stop();
     t.join();
   };
-  sync_wait(hello_udp(sched));
+  sync_wait(when_all(hello_udp(sched), hello_tcp(sched)));
   return 0;
 }
 #else

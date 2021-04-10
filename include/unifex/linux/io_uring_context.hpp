@@ -66,6 +66,10 @@ class io_uring_context {
   class async_socket;
   class send_to_sender;
   class receive_from_sender;
+  class accept_sender;
+  class connect_sender;
+  class send_sender;
+  class receive_sender;
   class scheduler;
 
   io_uring_context();
@@ -125,7 +129,7 @@ class io_uring_context {
           sqe.fd = fd_;
           sqe.off = off;
           sqe.addr = reinterpret_cast<std::uintptr_t>(data);
-          sqe.len = 1;
+          sqe.len = len;
           sqe.rw_flags = 0;
 
           sqe.user_data = reinterpret_cast<std::uintptr_t>(
@@ -608,6 +612,58 @@ class io_uring_context::write_sender {
   span<const std::byte> buffer_;
 };
 
+class io_uring_context::send_sender {
+  template <typename Receiver>
+  struct operation : io_operation_base<Receiver, operation> {
+    static constexpr auto op_code = IORING_OP_SEND;
+
+    friend io_uring_context;
+
+    explicit operation(send_sender& sender, Receiver&& r)
+        : io_operation_base<Receiver, operation>{sender, (Receiver &&) r}, buffer_{sender.buffer_} {
+    }
+    auto get_io_data() noexcept { return std::tuple{buffer_.data(), buffer_.size(), 0}; }
+    auto get_result() noexcept { return size_t(this->result_); }
+    span<const std::byte> buffer_;
+  };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
+
+public:
+  // Produces number of bytes read.
+  template <
+      template <typename...>
+      class Variant,
+      template <typename...>
+      class Tuple>
+  using value_types = Variant<Tuple<ssize_t>>;
+
+  // Note: Only case it might complete with exception_ptr is if the
+  // receiver's set_value() exits with an exception.
+  template <template <typename...> class Variant>
+  using error_types = Variant<std::error_code, std::exception_ptr>;
+
+  static constexpr bool sends_done = true;
+
+  explicit send_sender(
+      io_uring_context& context,
+      int fd,
+      span<const std::byte> buffer) noexcept
+      : context_{context}
+      , fd_{fd}
+      , buffer_{buffer} {}
+
+  template <typename Receiver>
+  auto connect(Receiver&& r) && {
+    return operation<Receiver>{*this, (Receiver &&) r};
+  }
+
+private:
+  io_uring_context& context_;
+  int fd_;
+  span<const std::byte> buffer_;
+};
+
 class io_uring_context::send_to_sender {
   template <typename Receiver>
   struct operation : io_operation_base<Receiver, operation> {
@@ -669,6 +725,56 @@ private:
   net::ip_endpoint to_;
 };
 
+class io_uring_context::receive_sender {
+  template <typename Receiver>
+  struct operation : io_operation_base<Receiver, operation> {
+    static constexpr auto op_code = IORING_OP_RECV;
+
+    friend io_uring_context;
+
+    explicit operation(receive_sender& sender, Receiver&& r)
+        : io_operation_base<Receiver, operation>{sender, (Receiver &&) r}, buffer_{sender.buffer_} {
+    }
+    auto get_io_data() noexcept { return std::tuple{buffer_.data(), buffer_.size(), 0}; }
+    auto get_result() noexcept { return size_t(this->result_); }
+    span<std::byte> buffer_;
+  };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
+
+public:
+  // Produces number of bytes read.
+  template <
+      template <typename...>
+      class Variant,
+      template <typename...>
+      class Tuple>
+  using value_types = Variant<Tuple<ssize_t>>;
+
+  // Note: Only case it might complete with exception_ptr is if the
+  // receiver's set_value() exits with an exception.
+  template <template <typename...> class Variant>
+  using error_types = Variant<std::error_code, std::exception_ptr>;
+
+  static constexpr bool sends_done = true;
+
+  explicit receive_sender(
+      io_uring_context& context, int fd, span<std::byte> buffer) noexcept
+      : context_{context}
+      , fd_{fd}
+      , buffer_{buffer} {}
+
+  template <typename Receiver>
+  auto connect(Receiver&& r) && {
+    return operation<Receiver>{*this, (Receiver &&) r};
+  }
+
+private:
+  io_uring_context& context_;
+  int fd_;
+  span<std::byte> buffer_;
+};
+
 class io_uring_context::receive_from_sender {
   template <typename Receiver>
   struct operation : io_operation_base<Receiver, operation> {
@@ -727,6 +833,117 @@ private:
   io_uring_context& context_;
   int fd_;
   span<const std::byte> buffer_;
+};
+
+class io_uring_context::accept_sender {
+  template <typename Receiver>
+  struct operation : io_operation_base<Receiver, operation> {
+    static constexpr auto op_code = IORING_OP_ACCEPT;
+
+    friend io_uring_context;
+
+    explicit operation(accept_sender& sender, Receiver&& r)
+        : io_operation_base<Receiver, operation>{sender, (Receiver &&) r} {
+    }
+    auto get_io_data() noexcept {
+      return std::tuple{reinterpret_cast<std::byte *>(&sockaddr_storage_), 0,
+                        reinterpret_cast<uint64_t>(&socklen_)};
+    }
+    auto get_result() noexcept {
+      return std::make_tuple(
+          net::ip_endpoint::from_sockaddr(
+              *reinterpret_cast<const sockaddr*>(&sockaddr_storage_)),
+          async_socket{this->context_, this->result_});
+    }
+    socklen_t socklen_{sizeof(sockaddr_storage)};
+    sockaddr_storage sockaddr_storage_{};
+  };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
+
+public:
+  // Produces number of bytes read.
+  template <
+      template <typename...>
+      class Variant,
+      template <typename...>
+      class Tuple>
+  using value_types = Variant<Tuple<net::ip_endpoint, async_socket>>;
+
+  // Note: Only case it might complete with exception_ptr is if the
+  // receiver's set_value() exits with an exception.
+  template <template <typename...> class Variant>
+  using error_types = Variant<std::error_code, std::exception_ptr>;
+
+  static constexpr bool sends_done = true;
+
+  explicit accept_sender(
+      io_uring_context& context, int fd) noexcept
+  : context_{context}
+  , fd_{fd} {}
+
+  template <typename Receiver>
+  auto connect(Receiver&& r) && {
+    return operation<Receiver>{*this, (Receiver &&) r};
+  }
+private:
+  io_uring_context& context_;
+  int fd_;
+};
+
+class io_uring_context::connect_sender {
+  template <typename Receiver>
+  struct operation : io_operation_base<Receiver, operation> {
+    static constexpr auto op_code = IORING_OP_CONNECT;
+
+    friend io_uring_context;
+
+    explicit operation(connect_sender& sender, Receiver&& r)
+        : io_operation_base<Receiver, operation>{sender, (Receiver &&) r} {
+      addr_len_ = sender.endpoint_.to_sockaddr(sockaddr_storage_);
+    }
+
+    auto get_result() noexcept { return this->result_; }
+
+    auto get_io_data() noexcept {
+      return std::tuple{reinterpret_cast<std::byte *>(&sockaddr_storage_), 0, addr_len_};
+    }
+    sockaddr_storage sockaddr_storage_{};
+    size_t addr_len_;
+  };
+  template <typename, template <class> typename>
+  friend class io_operation_base;
+
+public:
+  // Produces number of bytes read.
+  template <
+      template <typename...>
+      class Variant,
+      template <typename...>
+      class Tuple>
+  using value_types = Variant<Tuple<int>>;
+
+  // Note: Only case it might complete with exception_ptr is if the
+  // receiver's set_value() exits with an exception.
+  template <template <typename...> class Variant>
+  using error_types = Variant<std::error_code, std::exception_ptr>;
+
+  static constexpr bool sends_done = true;
+
+  explicit connect_sender(
+      io_uring_context& context, int fd, net::ip_endpoint&& endpoint) noexcept
+      : context_{context}
+      , fd_{fd}
+      , endpoint_{std::forward<net::ip_endpoint>(endpoint)} {}
+
+  template <typename Receiver>
+  auto connect(Receiver&& r) && {
+    return operation<Receiver>{*this, (Receiver &&) r};
+  }
+private:
+  io_uring_context& context_;
+  int fd_;
+  net::ip_endpoint endpoint_;
 };
 
 class io_uring_context::async_read_only_file {
@@ -835,6 +1052,21 @@ class io_uring_context::async_read_write_file {
       }
 
       // Customization points
+      friend auto
+      tag_invoke(tag_t<net::async_accept>, async_socket& socket) noexcept {
+        return accept_sender{socket.context_, socket.fd_.get()};
+      }
+      friend auto
+      tag_invoke(tag_t<net::async_connect>, async_socket& socket, net::ip_endpoint&& endpoint) noexcept {
+        return connect_sender{socket.context_, socket.fd_.get(), std::forward<net::ip_endpoint>(endpoint)};
+      }
+      friend auto tag_invoke(
+          tag_t<net::async_send>,
+          async_socket& socket,
+          span<const std::byte> buffer) noexcept {
+        return send_sender{
+            socket.context_, socket.fd_.get(), buffer};
+      }
       friend auto tag_invoke(
           tag_t<net::async_send_to>,
           async_socket& socket,
@@ -842,6 +1074,12 @@ class io_uring_context::async_read_write_file {
           span<const std::byte> buffer) noexcept {
         return send_to_sender{
             socket.context_, socket.fd_.get(), endpoint, buffer};
+      }
+      friend auto tag_invoke(
+          tag_t<net::async_receive>,
+          async_socket& socket,
+          span<std::byte> buffer) noexcept {
+        return receive_sender{socket.context_, socket.fd_.get(), buffer};
       }
       friend auto tag_invoke(
           tag_t<net::async_receive_from>,

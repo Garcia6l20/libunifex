@@ -32,6 +32,26 @@ namespace unifex::net
   }  // namespace open_socket_
   using open_socket_::open_socket;
 
+  namespace async_send_
+  {
+    const inline struct fn_ {
+      template <typename Socket, typename BufferSequence>
+      auto operator()(
+          Socket& socket,
+          BufferSequence&& bufferSequence) const
+          noexcept(unifex::is_nothrow_tag_invocable_v<
+                   fn_,
+                   Socket&,
+                   BufferSequence>) {
+        return unifex::tag_invoke(
+            *this,
+            socket,
+            std::forward<BufferSequence>(bufferSequence));
+      }
+    } async_send;
+  }  // namespace async_send_
+  using async_send_::async_send;
+
   namespace async_send_to_
   {
     const inline struct fn_ {
@@ -55,6 +75,20 @@ namespace unifex::net
   }  // namespace async_send_to_
   using async_send_to_::async_send_to;
 
+  namespace async_receive_
+  {
+    const inline struct fn_ {
+      template <typename Socket, typename BufferSequence>
+      auto operator()(Socket& socket, BufferSequence&& bufferSequence) const
+          noexcept(
+              unifex::
+                  is_nothrow_tag_invocable_v<fn_, Socket&, BufferSequence>) {
+        return unifex::tag_invoke(*this, socket, bufferSequence);
+      }
+    } async_receive;
+  }  // namespace async_receive_
+  using async_receive_::async_receive;
+
   namespace async_receive_from_
   {
     const inline struct fn_ {
@@ -69,14 +103,28 @@ namespace unifex::net
   }  // namespace async_receive_from_
   using async_receive_from_::async_receive_from;
 
-  //
-  //  G6_CPO_DEF(open_socket, _net_cpo)
-  //  G6_CPO_DEF(async_accept, _net_cpo)
-  //  G6_CPO_DEF(async_connect, _net_cpo)
-  //  G6_CPO_DEF(async_send, _net_cpo)
-  //  G6_CPO_DEF(async_send_to, _net_cpo)
-  //  G6_CPO_DEF(async_recv, _net_cpo)
-  //  G6_CPO_DEF(async_recv_from, _net_cpo)
-  //
-  //  G6_CPO_DEF(make_server, _net_cpo)
+  namespace async_accept_
+  {
+    const inline struct fn_ {
+      template <typename Socket>
+      auto operator()(Socket& socket) const
+          noexcept(unifex::is_nothrow_tag_invocable_v<fn_, Socket&>) {
+        return unifex::tag_invoke(*this, socket);
+      }
+    } async_accept;
+  }  // namespace async_accept_
+  using async_accept_::async_accept;
+
+  namespace async_connect_
+  {
+    const inline struct fn_ {
+      template <typename Socket, typename Endpoint>
+      auto operator()(Socket& socket, Endpoint&& endpoint) const
+          noexcept(unifex::is_nothrow_tag_invocable_v<fn_, Socket&, Endpoint>) {
+        return unifex::tag_invoke(*this, socket, (Endpoint &&) endpoint);
+      }
+    } async_connect;
+  }  // namespace async_connect_
+  using async_connect_::async_connect;
+
 }  // namespace unifex::net

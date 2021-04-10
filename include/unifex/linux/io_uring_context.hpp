@@ -78,10 +78,6 @@ class io_uring_context {
     void (*execute_)(operation_base*) noexcept;
   };
 
-  struct completion_base : operation_base {
-    int result_;
-  };
-
   struct stop_operation : operation_base {
     stop_operation() noexcept {
       this->execute_ = [](operation_base * op) noexcept {
@@ -123,16 +119,12 @@ class io_uring_context {
       time_point,
       &schedule_at_operation::dueTime_>;
 
-  bool is_running_on_io_thread() const noexcept;
   void run_impl(const bool& shouldStop);
 
   void schedule_impl(operation_base* op);
   void schedule_local(operation_base* op) noexcept;
   void schedule_local(operation_queue ops) noexcept;
-  void schedule_remote(operation_base* op) noexcept;
 
-  // Schedule some operation to be run when there is next available I/O slots.
-  void schedule_pending_io(operation_base* op) noexcept;
   void reschedule_pending_io(operation_base* op) noexcept;
 
   // Insert the timer operation into the queue of timers.
@@ -177,12 +169,6 @@ class io_uring_context {
   void update_timers() noexcept;
   bool try_submit_timer_io(const time_point& dueTime) noexcept;
   bool try_submit_timer_io_cancel() noexcept;
-
-  // Try to submit an entry to the submission queue
-  //
-  // If there is space in the queue then populateSqe
-  template <typename PopulateFn>
-  bool try_submit_io(PopulateFn populateSqe) noexcept;
 
   // Total number of operations submitted that have not yet
   // completed.
@@ -275,6 +261,21 @@ class io_uring_context {
 
   // Queue of operations enqueued by remote threads.
   atomic_intrusive_queue<operation_base, &operation_base::next_> remoteQueue_;
+
+protected:
+  struct completion_base : operation_base {
+    int result_;
+  };
+  void schedule_remote(operation_base* op) noexcept;
+  bool is_running_on_io_thread() const noexcept;
+  // Schedule some operation to be run when there is next available I/O slots.
+  void schedule_pending_io(operation_base* op) noexcept;
+
+  // Try to submit an entry to the submission queue
+  //
+  // If there is space in the queue then populateSqe
+  template <typename PopulateFn>
+  bool try_submit_io(PopulateFn populateSqe) noexcept;
 };
 
 template <typename StopToken>
